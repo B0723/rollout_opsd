@@ -142,6 +142,8 @@ class OPSDTrainer(SFTTrainer):
         jsd_token_clip: float | None = None,
         use_ema_teacher: bool = False,
         ema_decay: float = 0.999,
+        rollout_keep_ratio: float = 1.0,
+        rollout_select_mode: str = "dynamic",
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -185,6 +187,8 @@ class OPSDTrainer(SFTTrainer):
         self.use_ema_teacher = use_ema_teacher
         self.ema_decay = ema_decay
         self._ema_params = None  # lazily initialized on first optimizer step
+        self.rollout_keep_ratio = rollout_keep_ratio
+        self.rollout_select_mode = rollout_select_mode
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:
@@ -218,6 +222,14 @@ class OPSDTrainer(SFTTrainer):
             print(f"\n{'='*80}")
             print("REASON FIRST MODE ENABLED")
             print("Teacher will first reason about the privileged solution, then evaluate student's response")
+            print(f"{'='*80}\n")
+
+        if self.rollout_keep_ratio < 1.0:
+            print(f"\n{'='*80}")
+            print("DYNAMIC ROLLOUT SELECTION ENABLED")
+            print(f"  Mode:       {self.rollout_select_mode}")
+            print(f"  Keep ratio: {self.rollout_keep_ratio:.0%} of each batch")
+            print(f"  Score:      S_i = K_hat * (1 - H_hat)")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -458,19 +470,20 @@ class OPSDTrainer(SFTTrainer):
             # Compute the Generalized Jensen-Shannon Divergence
             jsd = beta * kl_teacher + (1 - beta) * kl_student
 
-        # Sum over vocab → per-token JSD [B, T].
-        # Without this, jsd[mask] on [B,T,V] allocates [n_valid, V] alongside the original
-        # [B,T,V] tensor, causing OOM at long sequence lengths (max_completion_length=2048).
-        jsd = jsd.sum(dim=-1)  # [B, T, V] → [B, T]
-
-        # Per-token clipping: applied at token level after vocab aggregation (semantically correct)
+        # Per-token clipping: applied per (token, vocab_entry) as in the original paper.
         if token_clip is not None:
             jsd = jsd.clamp(max=token_clip)
+
+        # Sum over vocab → per-token JSD [B, T].
+        # Must happen before masking: jsd[mask] on [B,T,V] produces [n_valid,V] which
+        # needs ~1.5 GB alongside the original ~5 GB tensor → OOM at generation=2048.
+        # After this sum, jsd[mask] produces [n_valid] (negligible memory).
+        jsd = jsd.sum(dim=-1)  # [B, T, V] → [B, T]
 
         # Masking
         if labels is not None:
             mask = labels != -100
-            jsd = jsd[mask]  # [n_valid] — was [n_valid, V] before the sum above
+            jsd = jsd[mask]  # [n_valid]
 
         # Apply reduction
         if reduction == "batchmean":
@@ -627,6 +640,73 @@ class OPSDTrainer(SFTTrainer):
                     if name in saved:
                         param.data = saved[name]
 
+    @torch.no_grad()
+    def _compute_rollout_scores(
+        self,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample quality score S_i = K_hat * (1 - H_hat).
+
+        Inputs are pre-computed log_probs (temperature already applied), so no
+        extra forward pass is needed — we reuse the tensors from compute_loss.
+
+        K_i : mean KL(teacher||student) per valid token  — teacher correction strength
+        H_i : mean student entropy per valid token        — student confidence
+        Both are min-max normalised within the batch (scale-invariant across training).
+        """
+        # KL(teacher || student) per token, summed over vocab → [B, T]
+        kl_per_token = F.kl_div(
+            student_log_probs, teacher_log_probs, reduction="none", log_target=True
+        ).sum(dim=-1)
+
+        # Student entropy: -Σ p·log_p → [B, T]
+        entropy_per_token = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
+
+        mask = (labels != -100).float()
+        lengths = mask.sum(dim=-1).clamp(min=1)
+
+        K = (kl_per_token * mask).sum(dim=-1) / lengths   # [B]
+        H = (entropy_per_token * mask).sum(dim=-1) / lengths  # [B]
+
+        K_hat = (K - K.min()) / (K.max() - K.min() + 1e-8)
+        H_hat = (H - H.min()) / (H.max() - H.min() + 1e-8)
+
+        return K_hat * (1.0 - H_hat)
+
+    def _select_rollout_indices(
+        self,
+        student_log_probs: torch.Tensor,
+        teacher_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict]:
+        """Return indices of rollouts to keep and a dict of loggable stats."""
+        batch_size = student_log_probs.shape[0]
+        k = max(1, int(batch_size * self.rollout_keep_ratio))
+
+        if k >= batch_size:
+            return torch.arange(batch_size, device=student_log_probs.device), {}
+
+        if self.rollout_select_mode == "dynamic":
+            scores = self._compute_rollout_scores(student_log_probs, teacher_log_probs, labels)
+            selected = torch.topk(scores, k).indices
+            rejected_mask = torch.ones(batch_size, dtype=torch.bool, device=scores.device)
+            rejected_mask[selected] = False
+            stats = {
+                "rollout_score_selected": scores[selected].mean().item(),
+                "rollout_score_rejected": scores[rejected_mask].mean().item(),
+                "rollout_keep_count": float(k),
+            }
+        elif self.rollout_select_mode == "random":
+            perm = torch.randperm(batch_size, device=student_log_probs.device)
+            selected = perm[:k]
+            stats = {"rollout_keep_count": float(k)}
+        else:
+            raise ValueError(f"Unknown rollout_select_mode: {self.rollout_select_mode!r}")
+
+        return selected, stats
+
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         """
         Compute the self-distillation loss with memory-efficient log-prob extraction.
@@ -757,6 +837,22 @@ class OPSDTrainer(SFTTrainer):
                 )
                 del student_logits_for_loss
                 empty_cache()
+
+                # === DYNAMIC ROLLOUT SELECTION ===
+                if self.rollout_keep_ratio < 1.0:
+                    selected, sel_stats = self._select_rollout_indices(
+                        student_log_probs, teacher_log_probs, shifted_labels
+                    )
+                    if selected.shape[0] < shifted_labels.shape[0]:
+                        rejected = torch.ones(
+                            shifted_labels.shape[0], dtype=torch.bool,
+                            device=shifted_labels.device
+                        )
+                        rejected[selected] = False
+                        shifted_labels = shifted_labels.clone()
+                        shifted_labels[rejected] = -100
+                        for stat_k, stat_v in sel_stats.items():
+                            self._metrics["train"][stat_k].append(stat_v)
 
                 loss = self.generalized_jsd_loss(
                     student_logits=student_log_probs,

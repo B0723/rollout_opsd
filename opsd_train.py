@@ -92,6 +92,21 @@ class CustomScriptArguments(ScriptArguments):
             "Typical range: 0.99–0.9999. Only used when use_ema_teacher=True."
         },
     )
+    rollout_keep_ratio: float = field(
+        default=1.0,
+        metadata={
+            "help": "Fraction of rollouts per batch to keep for distillation. "
+            "1.0 = full distillation (baseline). 0.5 = keep top 50%%. "
+            "Only active when rollout_select_mode is 'dynamic' or 'random'."
+        },
+    )
+    rollout_select_mode: str = field(
+        default="dynamic",
+        metadata={
+            "help": "Rollout selection strategy when rollout_keep_ratio < 1.0. "
+            "'dynamic': score S_i = K_hat*(1-H_hat). 'random': uniform random baseline."
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -112,14 +127,22 @@ if __name__ == "__main__":
         training_args.per_device_train_batch_size * training_args.gradient_accumulation_steps * num_processes
     )
 
+    # Rollout selection suffix — appended to both output_dir and wandb name
+    # so that baseline / random / dynamic experiments never share the same directory.
+    rollout_suffix = ""
+    if script_args.rollout_keep_ratio < 1.0:
+        keep_pct = int(script_args.rollout_keep_ratio * 100)
+        rollout_suffix = f"_{script_args.rollout_select_mode}{keep_pct}pct"
+
+    from pathlib import Path
+
     # Use custom run_config if provided, otherwise generate automatic name
     if script_args.run_config:
-        full_wandb_run_config = f"{script_args.run_config}_lr{lr_str}_bs{effective_batch_size}"
-        # Append run_config to output_dir if it doesn't already end with it
-        if not training_args.output_dir.endswith(script_args.run_config):
-            from pathlib import Path
-
-            training_args.output_dir = str(Path(training_args.output_dir) / script_args.run_config)
+        run_dir_name = f"{script_args.run_config}{rollout_suffix}"
+        full_wandb_run_config = f"{run_dir_name}_lr{lr_str}_bs{effective_batch_size}"
+        # Append run_dir_name to output_dir (includes rollout suffix)
+        if not training_args.output_dir.endswith(run_dir_name):
+            training_args.output_dir = str(Path(training_args.output_dir) / run_dir_name)
     else:
         # Extract model name from path (e.g., "Qwen3-1.7B" from "/home/siyanzhao/models/Qwen3-1.7B")
         model_name = model_args.model_name_or_path.split("/")[-1]
@@ -135,6 +158,10 @@ if __name__ == "__main__":
         # Add fixed_teacher to wandb name if enabled
         if script_args.fixed_teacher:
             full_wandb_run_config += "_fixteach"
+
+        # Append rollout suffix and update output_dir
+        full_wandb_run_config += rollout_suffix
+        training_args.output_dir = str(Path(training_args.output_dir) / full_wandb_run_config)
 
     # Print configuration info
     print(f"\n{'='*80}")
@@ -181,6 +208,8 @@ if __name__ == "__main__":
                 "top_k_loss": script_args.top_k_loss if script_args.top_k_loss > 0 else None,
                 "use_ema_teacher": script_args.use_ema_teacher,
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
+                "rollout_keep_ratio": script_args.rollout_keep_ratio,
+                "rollout_select_mode": script_args.rollout_select_mode if script_args.rollout_keep_ratio < 1.0 else None,
             },
         )
 
@@ -266,6 +295,8 @@ if __name__ == "__main__":
         jsd_token_clip=script_args.jsd_token_clip if script_args.jsd_token_clip > 0 else None,
         use_ema_teacher=script_args.use_ema_teacher,
         ema_decay=script_args.ema_decay,
+        rollout_keep_ratio=script_args.rollout_keep_ratio,
+        rollout_select_mode=script_args.rollout_select_mode,
     )
 
     if training_args.eval_strategy != "no":
