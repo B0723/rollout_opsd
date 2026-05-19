@@ -453,14 +453,19 @@ class OPSDTrainer(SFTTrainer):
             # Compute the Generalized Jensen-Shannon Divergence
             jsd = beta * kl_teacher + (1 - beta) * kl_student
 
-        # Per-token clipping: cap each token's divergence value
+        # Sum over vocab → per-token JSD [B, T].
+        # Without this, jsd[mask] on [B,T,V] allocates [n_valid, V] alongside the original
+        # [B,T,V] tensor, causing OOM at long sequence lengths (max_completion_length=2048).
+        jsd = jsd.sum(dim=-1)  # [B, T, V] → [B, T]
+
+        # Per-token clipping: applied at token level after vocab aggregation (semantically correct)
         if token_clip is not None:
             jsd = jsd.clamp(max=token_clip)
 
         # Masking
         if labels is not None:
             mask = labels != -100
-            jsd = jsd[mask]
+            jsd = jsd[mask]  # [n_valid] — was [n_valid, V] before the sum above
 
         # Apply reduction
         if reduction == "batchmean":
