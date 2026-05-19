@@ -381,6 +381,7 @@ class OPSDTrainer(SFTTrainer):
         temperature=1.0,
         reduction="batchmean",
         logits_are_probs=False,
+        logits_are_log_probs=False,
         top_k=None,
         token_clip=None,
     ):
@@ -413,7 +414,11 @@ class OPSDTrainer(SFTTrainer):
             loss: Scalar tensor with the generalized JSD loss
         """
 
-        if logits_are_probs:
+        if logits_are_log_probs:
+            # Inputs are already log_probs with temperature applied; use directly.
+            student_log_probs = student_logits
+            teacher_log_probs = teacher_logits
+        elif logits_are_probs:
             student_log_probs = torch.log(student_logits.clamp_min(1e-8))
             teacher_log_probs = torch.log(teacher_logits.clamp_min(1e-8))
         else:
@@ -731,17 +736,51 @@ class OPSDTrainer(SFTTrainer):
                 student_log_probs_sampled_masked,
             )
         else:
-            # Temperature is applied inside generalized_jsd_loss
-            loss = self.generalized_jsd_loss(
-                student_logits=student_logits_for_loss,
-                teacher_logits=teacher_logits_for_loss,
-                labels=shifted_labels,
-                beta=self.beta,
-                temperature=self.temperature,  # Let the function handle temperature
-                top_k=self.top_k_loss,
-                token_clip=self.jsd_token_clip,
-            )
-            del student_logits_for_loss, teacher_logits_for_loss
+            if not self.top_k_loss:
+                # Memory-efficient path: pre-compute log_probs and free raw logit tensors
+                # BEFORE calling generalized_jsd_loss. This prevents 4 large [B,T,V] tensors
+                # (student_logits, teacher_logits, student_log_probs, teacher_log_probs)
+                # from coexisting when kl_div tries to allocate yet another [B,T,V] tensor.
+                #
+                # Safe because log_softmax backward only needs its OUTPUT (log_probs),
+                # not its input (logits) — so deleting logits after computing log_probs
+                # does not affect gradient computation.
+                with torch.no_grad():
+                    teacher_log_probs = F.log_softmax(
+                        teacher_logits_for_loss / self.temperature, dim=-1
+                    )
+                del teacher_logits_for_loss
+                empty_cache()
+
+                student_log_probs = F.log_softmax(
+                    student_logits_for_loss / self.temperature, dim=-1
+                )
+                del student_logits_for_loss
+                empty_cache()
+
+                loss = self.generalized_jsd_loss(
+                    student_logits=student_log_probs,
+                    teacher_logits=teacher_log_probs,
+                    labels=shifted_labels,
+                    beta=self.beta,
+                    temperature=1.0,
+                    logits_are_log_probs=True,
+                    top_k=None,
+                    token_clip=self.jsd_token_clip,
+                )
+                del student_log_probs, teacher_log_probs
+            else:
+                # top_k needs raw logits for top-k token selection before softmax
+                loss = self.generalized_jsd_loss(
+                    student_logits=student_logits_for_loss,
+                    teacher_logits=teacher_logits_for_loss,
+                    labels=shifted_labels,
+                    beta=self.beta,
+                    temperature=self.temperature,
+                    top_k=self.top_k_loss,
+                    token_clip=self.jsd_token_clip,
+                )
+                del student_logits_for_loss, teacher_logits_for_loss
 
         empty_cache()
 
