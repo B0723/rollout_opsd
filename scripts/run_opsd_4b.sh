@@ -4,16 +4,16 @@ accelerate launch \
     --gradient_accumulation_steps 1 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path /data0/shared/Qwen3-4B \
+    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-4B \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
     --per_device_train_batch_size 4 \
     --gradient_checkpointing \
     --gradient_accumulation_steps 1 \
-    --output_dir  /data0/siyanz/opsd/ \
-    --run_config qwen34b_gen1024_fixteacher_temp11_forwardbeta0_clip005 \
-    --num_train_epochs 30 \
-    --max_completion_length 1024 \
+    --output_dir  /home/sankuai/buyixin02/rollout_opsd/output/ \
+    --run_config qwen34b_gen2048_fixteacher_temp11_forwardbeta0_clip005 \
+    --max_steps 100 \
+    --max_completion_length 2048 \
     --save_steps 25 \
     --logging_steps 2 \
     --attn_implementation flash_attention_2 \

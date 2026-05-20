@@ -7,8 +7,8 @@ CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 accelerate launch \
     --learning_rate 5e-6 \
     --per_device_train_batch_size 1 \
     --gradient_accumulation_steps 4 \
-    --model_name_or_path /data0/shared/Qwen3-4B \
-    --output_dir /data0/siyanz/grpo/ \
+    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-4B \
+    --output_dir /home/sankuai/buyixin02/rollout_opsd/output/ \
     --run_config qwen4b-2epoch \
     --num_train_epochs 2 \
     --num_iterations 2 \

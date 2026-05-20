@@ -1,20 +1,23 @@
-accelerate launch \
+export https_proxy=http://10.217.142.137:8080
+export WANDB_MODE=online
+
+    accelerate launch \
     --config_file accelerate.yaml \
-    --num_processes 8 \
+    --num_processes 4 \
     --gradient_accumulation_steps 2 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-8B \
+    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-1.7B \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
-    --per_device_train_batch_size 2 \
+    --per_device_train_batch_size 4 \
     --gradient_checkpointing \
     --gradient_accumulation_steps 2 \
     --output_dir  /home/sankuai/buyixin02/rollout_opsd/output/ \
-    --run_config qwen38b_gen2048_fixteacher_temp11_forwardbeta0_clip006 \
+    --run_config qwen31b_gen2048_fixteacher_temp11_forwardbeta0_clip005 \
     --max_steps 100 \
     --max_completion_length 2048 \
-    --save_steps 25 \
+    --save_steps 5 \
     --logging_steps 2 \
     --attn_implementation flash_attention_2 \
     --torch_dtype bfloat16 \
@@ -33,5 +36,5 @@ accelerate launch \
     --top_k 20 \
     --lmbda 1 \
     --fixed_teacher \
-    --jsd_token_clip 0.06 \
+    --jsd_token_clip 0.05 \
     --wandb_project OPSD

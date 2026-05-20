@@ -1,7 +1,7 @@
 #!/bin/bash
 
 BASE_MODEL="/home/sankuai/buyixin02/egsd/model/Qwen3-1.7B"
-CHECKPOINT_BASE="/home/sankuai/buyixin02/rollout_opsd/output/qwen31b_gen2048_fixteacher_temp11_forwardbeta0_clip005"
+CHECKPOINT_BASE="/home/sankuai/buyixin02/rollout_opsd/output/qwen31b_gen2048_fixteacher_temp11_forwardbeta0_clip005_dynamic50pct_dynamic50pct"
 
 for CKPT in checkpoint-70 checkpoint-75 checkpoint-80 checkpoint-85 checkpoint-90 checkpoint-95 checkpoint-100; do
     echo "========== Evaluating $CKPT =========="
