@@ -886,37 +886,6 @@ class OPSDTrainer(SFTTrainer):
         del outputs_student
         empty_cache()
 
-        # === BoN PRE-SELECTION (before Teacher forward) ===
-        # For bon_n > 1: all B×N rollouts have been student-forwarded above.
-        # Score within each problem's group of N, select 1 per problem,
-        # then slice teacher inputs so Teacher forward only runs on B selected sequences.
-        _bon_student_log_probs = None
-        if (
-            not self.use_thinking_machines_loss
-            and not self.top_k_loss
-            and self.bon_n > 1
-        ):
-            _bon_student_log_probs = F.log_softmax(
-                student_logits_for_loss / self.temperature, dim=-1
-            )
-            del student_logits_for_loss
-            empty_cache()
-
-            bon_selected = self._bon_select_per_group(_bon_student_log_probs, shifted_labels)
-
-            # Slice student log_probs and labels to the B selected rollouts.
-            # Use loop+cat instead of fancy indexing: tensor[indices] on [B*N,T,V] with
-            # V=152064 triggers "CUDA invalid configuration argument" (kernel grid too large).
-            # Each tensor[i:i+1] is a small [1,T,V] slice → safe for CUDA.
-            _bon_student_log_probs = torch.cat(
-                [_bon_student_log_probs[i:i+1] for i in bon_selected.tolist()], dim=0
-            )  # [B, T, V]
-            shifted_labels = shifted_labels[bon_selected]                   # [B, T]
-
-            # Slice teacher inputs → Teacher forward runs only on the B best rollouts
-            inputs["teacher_input_ids"] = inputs["teacher_input_ids"][bon_selected]
-            inputs["teacher_attention_mask"] = inputs["teacher_attention_mask"][bon_selected]
-
         # === dynamic_lh PRE-SELECTION (before Teacher forward) ===
         # For dynamic_lh only: compute scores from Student alone, select the top-k,
         # then slice teacher_input_ids so the Teacher forward only runs on selected samples.
@@ -1026,13 +995,10 @@ class OPSDTrainer(SFTTrainer):
                 empty_cache()
 
                 # --- Student log_probs ---
-                # bon_n > 1 or dynamic_lh: already computed and pre-selected above;
+                # dynamic_lh / high_entropy: already computed and pre-selected above;
                 # student_logits_for_loss was freed there too.
                 # All other modes: compute here and free logits.
-                if _bon_student_log_probs is not None:
-                    student_log_probs = _bon_student_log_probs
-                    _bon_student_log_probs = None
-                elif _lh_student_log_probs is not None:
+                if _lh_student_log_probs is not None:
                     student_log_probs = _lh_student_log_probs
                     _lh_student_log_probs = None
                 else:
@@ -1236,7 +1202,7 @@ class OPSDTrainer(SFTTrainer):
             if self.accelerator.is_main_process:
                 completion_ids = self.vllm_client.generate(
                     prompts=all_prompts_text,
-                    n=self.bon_n,  # bon_n>=1; n>1 enables Best-of-N generation
+                    n=1,  # BoN is handled by looping in training_step, not here
                     repetition_penalty=repetition_penalty,
                     temperature=temperature,
                     top_p=top_p,
@@ -1247,12 +1213,11 @@ class OPSDTrainer(SFTTrainer):
                     guided_decoding_regex=self.vllm_guided_decoding_regex,
                 )
             else:
-                completion_ids = [None] * len(all_prompts_text) * self.bon_n
+                completion_ids = [None] * len(all_prompts_text)
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
-            # Each process owns bon_n completions per prompt
             process_slice = slice(
-                self.accelerator.process_index * len(prompts_text_for_vllm) * self.bon_n,
-                (self.accelerator.process_index + 1) * len(prompts_text_for_vllm) * self.bon_n,
+                self.accelerator.process_index * len(prompts_text_for_vllm),
+                (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
             )
             completion_ids = completion_ids[process_slice]
         elif self.vllm_mode == "colocate":
@@ -1263,7 +1228,7 @@ class OPSDTrainer(SFTTrainer):
             else:
                 guided_decoding = None
             sampling_params = SamplingParams(
-                n=self.bon_n,  # bon_n>=1; n>1 enables Best-of-N generation
+                n=1,  # BoN is handled by looping in training_step, not here
                 repetition_penalty=repetition_penalty,
                 temperature=temperature,
                 top_p=top_p,
@@ -1331,10 +1296,6 @@ class OPSDTrainer(SFTTrainer):
         ).to(device)
         prompt_ids = prompt_tokenized.input_ids
 
-        # BoN: each prompt has bon_n completions → repeat prompt_ids N times so indices align
-        if self.bon_n > 1:
-            prompt_ids = prompt_ids.repeat_interleave(self.bon_n, dim=0)
-
         completion_ids_tensors = [torch.tensor(ids, device=device) for ids in completion_ids]
         # Manually pad/truncate completions to max_completion_length length before using pad function
         padded_completion_ids_list = []
@@ -1381,10 +1342,6 @@ class OPSDTrainer(SFTTrainer):
         for comp_ids in completion_ids:
             completion_text = self.processing_class.decode(comp_ids, skip_special_tokens=False)
             completion_texts.append(completion_text)
-
-        # BoN: repeat prompt texts to match B×N completions
-        if self.bon_n > 1:
-            prompts_text_with_special = [p for p in prompts_text_with_special for _ in range(self.bon_n)]
 
         return new_input_ids, new_attention_mask, new_labels, prompts_text_with_special, completion_texts
 
@@ -1710,7 +1667,44 @@ class OPSDTrainer(SFTTrainer):
                 inputs["teacher_prompt_length"] = teacher_prompts_with_reasoning.shape[1]
 
         # === GENERATION PHASE ===
-        if self.use_vllm:
+        if self.bon_n > 1 and self.use_vllm:
+            # BoN: generate bon_n rollouts per problem via a for-loop (n=1 each time).
+            # This keeps memory at [B, T, V] per iteration instead of [B×N, T, V] — no OOM.
+            # Selection uses shortest completion length as a quality proxy (no forward needed).
+            _student_prompt_len = inputs["student_prompt_length"]
+            _pad_id = self.processing_class.pad_token_id
+            _bon_gids, _bon_amasks, _bon_lens = [], [], []
+            _bon_ptexts, _bon_ctexts = [], []
+
+            for _ in range(self.bon_n):
+                self._wake_vllm_if_needed()
+                _r = self._generate_on_policy_outputs_vllm(
+                    inputs, self.generation_config, _pad_id
+                )
+                _gids, _amask, _, _ptexts, _ctexts = _r
+                # Completion length: count non-pad tokens (no neural forward needed)
+                _comp = _gids[:, _student_prompt_len:]
+                _lens = (_comp != _pad_id).float().sum(dim=-1)  # [B]
+                _bon_gids.append(_gids)
+                _bon_amasks.append(_amask)
+                _bon_lens.append(_lens)
+                _bon_ptexts.append(_ptexts)
+                _bon_ctexts.append(_ctexts)
+
+            # For each problem, select the iteration that produced the shortest completion
+            _all_lens = torch.stack(_bon_lens, dim=1)          # [B, bon_n]
+            _best = _all_lens.argmin(dim=1)                    # [B]
+            _B = _best.shape[0]
+            generated_ids = torch.stack(
+                [_bon_gids[_best[b].item()][b] for b in range(_B)], dim=0
+            )
+            generated_attention_mask = torch.stack(
+                [_bon_amasks[_best[b].item()][b] for b in range(_B)], dim=0
+            )
+            prompt_texts = [_bon_ptexts[_best[b].item()][b] for b in range(_B)]
+            completion_texts = [_bon_ctexts[_best[b].item()][b] for b in range(_B)]
+
+        elif self.use_vllm:
             self._wake_vllm_if_needed()
             result = self._generate_on_policy_outputs_vllm(
                 inputs, self.generation_config, self.processing_class.pad_token_id
@@ -1743,14 +1737,7 @@ class OPSDTrainer(SFTTrainer):
         inputs["student_attention_mask"] = generated_attention_mask
 
         # Construct teacher full sequence: [teacher_prompt][generation]
-        # BoN: teacher_prompts is [B, T_t]; expand to [B×N, T_t] to match B×N generations.
-        # student_prompt_lengths_per_example also needs expanding for correct label masking.
         teacher_prompts = inputs["teacher_prompts"]
-        if self.bon_n > 1:
-            teacher_prompts = teacher_prompts.repeat_interleave(self.bon_n, dim=0)
-            inputs["student_prompt_lengths_per_example"] = (
-                inputs["student_prompt_lengths_per_example"].repeat_interleave(self.bon_n)
-            )
         teacher_full_ids = torch.cat([teacher_prompts, generation_ids], dim=1)
 
         # Create attention mask for teacher
