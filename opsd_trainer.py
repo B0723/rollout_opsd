@@ -228,9 +228,10 @@ class OPSDTrainer(SFTTrainer):
 
         if self.rollout_keep_ratio < 1.0:
             score_formula = {
-                "dynamic":    "S_i = K_hat * (1 - H_hat)            [requires Teacher forward on full batch]",
-                "dynamic_lh": "S_i = (1 - L_hat) * (1 - H_hat)     [Teacher-free: only ~50% Teacher compute]",
-                "random":     "uniform random",
+                "dynamic":      "S_i = K_hat * (1 - H_hat)            [Teacher forward on full batch]",
+                "dynamic_lh":   "S_i = (1 - L_hat) * (1 - H_hat)     [Teacher-free, Teacher on selected only]",
+                "high_entropy": "S_i = H_i  (highest entropy)         [Teacher-free, Teacher on selected only]",
+                "random":       "uniform random",
             }.get(self.rollout_select_mode, self.rollout_select_mode)
             print(f"\n{'='*80}")
             print("DYNAMIC ROLLOUT SELECTION ENABLED")
@@ -733,6 +734,24 @@ class OPSDTrainer(SFTTrainer):
         return offsets + best_in_group  # [B]  global indices
 
     @torch.no_grad()
+    def _compute_rollout_scores_high_entropy(
+        self,
+        student_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Score by student entropy alone: HIGHER entropy → selected.
+
+        Selects the rollouts where the student is most uncertain/confused,
+        focusing distillation on the hardest examples in each batch.
+        Teacher-free: only student log_probs needed.
+        """
+        entropy_per_token = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
+        mask = (labels != -100).float()
+        lengths = mask.sum(dim=-1).clamp(min=1)
+        H = (entropy_per_token * mask).sum(dim=-1) / lengths  # [B]
+        return H  # topk keeps the largest → high entropy selected
+
+    @torch.no_grad()
     def _compute_rollout_scores(
         self,
         student_log_probs: torch.Tensor,
@@ -793,6 +812,18 @@ class OPSDTrainer(SFTTrainer):
         elif self.rollout_select_mode == "dynamic_lh":
             # Teacher-free: scores from student entropy + length only
             scores = self._compute_rollout_scores_lh(student_log_probs, labels)
+            selected = torch.topk(scores, k).indices
+            rejected_mask = torch.ones(batch_size, dtype=torch.bool, device=scores.device)
+            rejected_mask[selected] = False
+            stats = {
+                "rollout_score_selected": scores[selected].mean().item(),
+                "rollout_score_rejected": scores[rejected_mask].mean().item(),
+                "rollout_keep_count": float(k),
+            }
+        elif self.rollout_select_mode == "high_entropy":
+            # Teacher-free: select top-k by HIGHEST student entropy.
+            # Focuses distillation on the rollouts where the student is most confused.
+            scores = self._compute_rollout_scores_high_entropy(student_log_probs, labels)
             selected = torch.topk(scores, k).indices
             rejected_mask = torch.ones(batch_size, dtype=torch.bool, device=scores.device)
             rejected_mask[selected] = False
@@ -895,7 +926,7 @@ class OPSDTrainer(SFTTrainer):
             not self.use_thinking_machines_loss
             and not self.top_k_loss
             and self.rollout_keep_ratio < 1.0
-            and self.rollout_select_mode == "dynamic_lh"
+            and self.rollout_select_mode in ("dynamic_lh", "high_entropy")
         ):
             _lh_student_log_probs = F.log_softmax(
                 student_logits_for_loss / self.temperature, dim=-1
@@ -1011,9 +1042,9 @@ class OPSDTrainer(SFTTrainer):
                     del student_logits_for_loss
                     empty_cache()
 
-                # === DYNAMIC ROLLOUT SELECTION (dynamic K,H or random — NOT dynamic_lh or BoN) ===
-                # dynamic_lh and bon_n>1 already handled pre-selection before Teacher forward.
-                if self.rollout_keep_ratio < 1.0 and self.rollout_select_mode != "dynamic_lh" and self.bon_n == 1:
+                # === DYNAMIC ROLLOUT SELECTION (dynamic K,H or random — NOT teacher-free or BoN) ===
+                # dynamic_lh, high_entropy, and bon_n>1 already handled pre-selection before Teacher forward.
+                if self.rollout_keep_ratio < 1.0 and self.rollout_select_mode not in ("dynamic_lh", "high_entropy") and self.bon_n == 1:
                     selected, sel_stats = self._select_rollout_indices(
                         student_log_probs, teacher_log_probs, shifted_labels
                     )

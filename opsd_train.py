@@ -104,9 +104,10 @@ class CustomScriptArguments(ScriptArguments):
         default="dynamic",
         metadata={
             "help": "Rollout selection strategy when rollout_keep_ratio < 1.0. "
-            "'dynamic': S_i = K_hat*(1-H_hat), requires Teacher forward on full batch. "
-            "'dynamic_lh': S_i = (1-L_hat)*(1-H_hat), Teacher-free scoring — Teacher "
-            "forward only runs on selected samples (~50%% Teacher compute). "
+            "'dynamic': S_i = K_hat*(1-H_hat), Teacher forward on full batch. "
+            "'dynamic_lh': S_i = (1-L_hat)*(1-H_hat), Teacher-free, Teacher on selected only. "
+            "'high_entropy': select top-k%% by HIGHEST student entropy (most confused), "
+            "Teacher-free, Teacher on selected only. Ratio controlled by rollout_keep_ratio. "
             "'random': uniform random baseline."
         },
     )
