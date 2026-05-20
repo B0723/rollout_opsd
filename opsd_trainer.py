@@ -873,8 +873,13 @@ class OPSDTrainer(SFTTrainer):
 
             bon_selected = self._bon_select_per_group(_bon_student_log_probs, shifted_labels)
 
-            # Slice student log_probs and labels to the B selected rollouts
-            _bon_student_log_probs = _bon_student_log_probs[bon_selected]  # [B, T, V]
+            # Slice student log_probs and labels to the B selected rollouts.
+            # Use loop+cat instead of fancy indexing: tensor[indices] on [B*N,T,V] with
+            # V=152064 triggers "CUDA invalid configuration argument" (kernel grid too large).
+            # Each tensor[i:i+1] is a small [1,T,V] slice → safe for CUDA.
+            _bon_student_log_probs = torch.cat(
+                [_bon_student_log_probs[i:i+1] for i in bon_selected.tolist()], dim=0
+            )  # [B, T, V]
             shifted_labels = shifted_labels[bon_selected]                   # [B, T]
 
             # Slice teacher inputs → Teacher forward runs only on the B best rollouts
@@ -902,9 +907,13 @@ class OPSDTrainer(SFTTrainer):
                 _lh_student_log_probs, None, shifted_labels
             )
             if selected.shape[0] < _lh_student_log_probs.shape[0]:
-                # Slice student log_probs and labels to selected rows
-                _lh_student_log_probs = _lh_student_log_probs[selected]
-                shifted_labels = shifted_labels[selected]
+                # Slice student log_probs to selected rows.
+                # Use loop+cat instead of fancy indexing: tensor[indices] on [B,T,V] with
+                # V=152064 triggers "CUDA invalid configuration argument" (kernel too large).
+                _lh_student_log_probs = torch.cat(
+                    [_lh_student_log_probs[i:i+1] for i in selected.tolist()], dim=0
+                )  # [k, T, V]
+                shifted_labels = shifted_labels[selected]      # [k, T]  — 2D, safe
                 # Slice Teacher inputs so Teacher forward only runs on k samples
                 inputs["teacher_input_ids"] = inputs["teacher_input_ids"][selected]
                 inputs["teacher_attention_mask"] = inputs["teacher_attention_mask"][selected]
