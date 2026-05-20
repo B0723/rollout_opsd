@@ -1,21 +1,32 @@
 export https_proxy=http://10.217.142.137:8080
 export WANDB_MODE=online
 
-# Baseline OPSD — Qwen3-1.7B  4 GPU  effective_bs=32
+# Best-of-N OPSD — Qwen3-8B  8 GPU  effective_bs=32
+# Generates bon_n rollouts per problem, selects best by (1-L_hat)*(1-H_hat),
+# Teacher forward runs only on the selected rollout per problem.
+# Usage:
+#   bash run_bon_8b.sh        # default N=4
+#   bash run_bon_8b.sh 2      # N=2
+BON_N=${1:-4}
+
+# NOTE: Student forward processes per_device_batch*bon_n sequences per GPU.
+# With per_device_batch=2 and bon_n=4: 8 sequences → ~4.6 GB student log_probs.
+# If OOM, reduce vllm_gpu_memory_utilization (e.g. to 0.5) to free more training memory.
+
 accelerate launch \
     --config_file accelerate.yaml \
-    --num_processes 4 \
+    --num_processes 8 \
     --gradient_accumulation_steps 2 \
     --main_process_port 12949 \
     opsd_train.py \
-    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-1.7B \
+    --model_name_or_path /home/sankuai/buyixin02/egsd/model/Qwen3-8B \
     --learning_rate 5e-6 \
     --max_grad_norm 0.1 \
-    --per_device_train_batch_size 4 \
+    --per_device_train_batch_size 2 \
     --gradient_checkpointing \
     --gradient_accumulation_steps 2 \
     --output_dir /home/sankuai/buyixin02/rollout_opsd/output/ \
-    --run_config qwen31b_gen2048_fixteacher_temp11_forwardbeta0_clip005 \
+    --run_config qwen38b_gen2048_fixteacher_temp11_forwardbeta0_clip006 \
     --max_steps 100 \
     --max_completion_length 2048 \
     --save_steps 5 \
@@ -37,5 +48,6 @@ accelerate launch \
     --top_k 20 \
     --lmbda 1 \
     --fixed_teacher \
-    --jsd_token_clip 0.05 \
+    --jsd_token_clip 0.06 \
+    --bon_n ${BON_N} \
     --wandb_project OPSD

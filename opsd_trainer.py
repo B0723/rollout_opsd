@@ -144,6 +144,7 @@ class OPSDTrainer(SFTTrainer):
         ema_decay: float = 0.999,
         rollout_keep_ratio: float = 1.0,
         rollout_select_mode: str = "dynamic",
+        bon_n: int = 1,
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -189,6 +190,7 @@ class OPSDTrainer(SFTTrainer):
         self._ema_params = None  # lazily initialized on first optimizer step
         self.rollout_keep_ratio = rollout_keep_ratio
         self.rollout_select_mode = rollout_select_mode
+        self.bon_n = bon_n
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:
@@ -225,11 +227,24 @@ class OPSDTrainer(SFTTrainer):
             print(f"{'='*80}\n")
 
         if self.rollout_keep_ratio < 1.0:
+            score_formula = {
+                "dynamic":    "S_i = K_hat * (1 - H_hat)            [requires Teacher forward on full batch]",
+                "dynamic_lh": "S_i = (1 - L_hat) * (1 - H_hat)     [Teacher-free: only ~50% Teacher compute]",
+                "random":     "uniform random",
+            }.get(self.rollout_select_mode, self.rollout_select_mode)
             print(f"\n{'='*80}")
             print("DYNAMIC ROLLOUT SELECTION ENABLED")
             print(f"  Mode:       {self.rollout_select_mode}")
             print(f"  Keep ratio: {self.rollout_keep_ratio:.0%} of each batch")
-            print(f"  Score:      S_i = K_hat * (1 - H_hat)")
+            print(f"  Score:      {score_formula}")
+            print(f"{'='*80}\n")
+
+        if self.bon_n > 1:
+            print(f"\n{'='*80}")
+            print("BEST-OF-N ENABLED")
+            print(f"  N per problem: {self.bon_n}")
+            print(f"  Selection:     S_i = (1-L_hat)*(1-H_hat) within each problem group")
+            print(f"  Teacher cost:  same as N=1 (Teacher only forwards selected rollouts)")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -641,6 +656,83 @@ class OPSDTrainer(SFTTrainer):
                         param.data = saved[name]
 
     @torch.no_grad()
+    def _compute_rollout_scores_lh(
+        self,
+        student_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Per-sample quality score S_i = (1 - L_hat) * (1 - H_hat).
+
+        Teacher-free: uses only Student log_probs, so selection can happen
+        BEFORE the Teacher forward pass, cutting Teacher compute by ~50%.
+
+        L_i : number of valid (non-masked) tokens  — shorter = more focused
+        H_i : mean student entropy per valid token  — lower = more confident
+        Both are min-max normalised within the current batch.
+        """
+        # Student entropy: -Σ p·log_p → [B, T]
+        entropy_per_token = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
+
+        mask = (labels != -100).float()
+        lengths = mask.sum(dim=-1).clamp(min=1)  # [B]  actual valid token count
+
+        H = (entropy_per_token * mask).sum(dim=-1) / lengths  # [B]
+        L = lengths                                             # [B]
+
+        H_hat = (H - H.min()) / (H.max() - H.min() + 1e-8)
+        L_hat = (L - L.min()) / (L.max() - L.min() + 1e-8)
+
+        return (1.0 - L_hat) * (1.0 - H_hat)
+
+    @torch.no_grad()
+    def _bon_select_per_group(
+        self,
+        student_log_probs: torch.Tensor,
+        labels: torch.Tensor,
+    ) -> torch.Tensor:
+        """Best-of-N selection: within each group of bon_n rollouts (same problem),
+        select the 1 best rollout using S_i = (1-L_hat)*(1-H_hat).
+
+        Normalization is per-group (within the N rollouts of the same problem),
+        not across the whole batch — so different problems' difficulty doesn't interfere.
+
+        Args:
+            student_log_probs: [B*bon_n, T, V]  all rollouts, grouped by problem
+            labels:            [B*bon_n, T]     corresponding labels
+
+        Returns:
+            selected: [B]  global indices (in range 0..B*bon_n-1) of best rollout per problem
+        """
+        n = self.bon_n
+        batch_total = student_log_probs.shape[0]  # B × bon_n
+        b_problems = batch_total // n
+
+        # Entropy per sample: [B×N]
+        entropy_per_token = -(student_log_probs.exp() * student_log_probs).sum(dim=-1)
+        mask = (labels != -100).float()
+        lengths = mask.sum(dim=-1).clamp(min=1)
+        H = (entropy_per_token * mask).sum(dim=-1) / lengths  # [B×N]
+        L = lengths                                            # [B×N]
+
+        # Reshape to [B, N] for within-group normalization
+        H_g = H.view(b_problems, n)  # [B, N]
+        L_g = L.view(b_problems, n)  # [B, N]
+
+        def group_min_max(x):
+            x_min = x.min(dim=1, keepdim=True).values
+            x_max = x.max(dim=1, keepdim=True).values
+            return (x - x_min) / (x_max - x_min + 1e-8)
+
+        H_hat = group_min_max(H_g)  # [B, N]
+        L_hat = group_min_max(L_g)  # [B, N]
+
+        scores = (1.0 - L_hat) * (1.0 - H_hat)  # [B, N]
+
+        best_in_group = scores.argmax(dim=1)  # [B]  index within the group (0..N-1)
+        offsets = torch.arange(b_problems, device=student_log_probs.device) * n
+        return offsets + best_in_group  # [B]  global indices
+
+    @torch.no_grad()
     def _compute_rollout_scores(
         self,
         student_log_probs: torch.Tensor,
@@ -690,6 +782,17 @@ class OPSDTrainer(SFTTrainer):
 
         if self.rollout_select_mode == "dynamic":
             scores = self._compute_rollout_scores(student_log_probs, teacher_log_probs, labels)
+            selected = torch.topk(scores, k).indices
+            rejected_mask = torch.ones(batch_size, dtype=torch.bool, device=scores.device)
+            rejected_mask[selected] = False
+            stats = {
+                "rollout_score_selected": scores[selected].mean().item(),
+                "rollout_score_rejected": scores[rejected_mask].mean().item(),
+                "rollout_keep_count": float(k),
+            }
+        elif self.rollout_select_mode == "dynamic_lh":
+            # Teacher-free: scores from student entropy + length only
+            scores = self._compute_rollout_scores_lh(student_log_probs, labels)
             selected = torch.topk(scores, k).indices
             rejected_mask = torch.ones(batch_size, dtype=torch.bool, device=scores.device)
             rejected_mask[selected] = False
@@ -751,6 +854,62 @@ class OPSDTrainer(SFTTrainer):
 
         del outputs_student
         empty_cache()
+
+        # === BoN PRE-SELECTION (before Teacher forward) ===
+        # For bon_n > 1: all B×N rollouts have been student-forwarded above.
+        # Score within each problem's group of N, select 1 per problem,
+        # then slice teacher inputs so Teacher forward only runs on B selected sequences.
+        _bon_student_log_probs = None
+        if (
+            not self.use_thinking_machines_loss
+            and not self.top_k_loss
+            and self.bon_n > 1
+        ):
+            _bon_student_log_probs = F.log_softmax(
+                student_logits_for_loss / self.temperature, dim=-1
+            )
+            del student_logits_for_loss
+            empty_cache()
+
+            bon_selected = self._bon_select_per_group(_bon_student_log_probs, shifted_labels)
+
+            # Slice student log_probs and labels to the B selected rollouts
+            _bon_student_log_probs = _bon_student_log_probs[bon_selected]  # [B, T, V]
+            shifted_labels = shifted_labels[bon_selected]                   # [B, T]
+
+            # Slice teacher inputs → Teacher forward runs only on the B best rollouts
+            inputs["teacher_input_ids"] = inputs["teacher_input_ids"][bon_selected]
+            inputs["teacher_attention_mask"] = inputs["teacher_attention_mask"][bon_selected]
+
+        # === dynamic_lh PRE-SELECTION (before Teacher forward) ===
+        # For dynamic_lh only: compute scores from Student alone, select the top-k,
+        # then slice teacher_input_ids so the Teacher forward only runs on selected samples.
+        # This physically halves Teacher compute vs. dynamic (K,H) which needs full Teacher.
+        _lh_student_log_probs = None  # sentinel: None means student_logits_for_loss still live
+        if (
+            not self.use_thinking_machines_loss
+            and not self.top_k_loss
+            and self.rollout_keep_ratio < 1.0
+            and self.rollout_select_mode == "dynamic_lh"
+        ):
+            _lh_student_log_probs = F.log_softmax(
+                student_logits_for_loss / self.temperature, dim=-1
+            )
+            del student_logits_for_loss  # free early; log_softmax backward only needs output
+            empty_cache()
+
+            selected, sel_stats = self._select_rollout_indices(
+                _lh_student_log_probs, None, shifted_labels
+            )
+            if selected.shape[0] < _lh_student_log_probs.shape[0]:
+                # Slice student log_probs and labels to selected rows
+                _lh_student_log_probs = _lh_student_log_probs[selected]
+                shifted_labels = shifted_labels[selected]
+                # Slice Teacher inputs so Teacher forward only runs on k samples
+                inputs["teacher_input_ids"] = inputs["teacher_input_ids"][selected]
+                inputs["teacher_attention_mask"] = inputs["teacher_attention_mask"][selected]
+                for stat_k, stat_v in sel_stats.items():
+                    self._metrics["train"][stat_k].append(stat_v)
 
         # === TEACHER FORWARD - Extract log-probs immediately ===
         # Choose teacher context based on mode:
@@ -817,14 +976,8 @@ class OPSDTrainer(SFTTrainer):
             )
         else:
             if not self.top_k_loss:
-                # Memory-efficient path: pre-compute log_probs and free raw logit tensors
-                # BEFORE calling generalized_jsd_loss. This prevents 4 large [B,T,V] tensors
-                # (student_logits, teacher_logits, student_log_probs, teacher_log_probs)
-                # from coexisting when kl_div tries to allocate yet another [B,T,V] tensor.
-                #
-                # Safe because log_softmax backward only needs its OUTPUT (log_probs),
-                # not its input (logits) — so deleting logits after computing log_probs
-                # does not affect gradient computation.
+                # --- Teacher log_probs (Teacher forward already ran above, potentially on
+                #     a reduced set for dynamic_lh) ---
                 with torch.no_grad():
                     teacher_log_probs = F.log_softmax(
                         teacher_logits_for_loss / self.temperature, dim=-1
@@ -832,14 +985,26 @@ class OPSDTrainer(SFTTrainer):
                 del teacher_logits_for_loss
                 empty_cache()
 
-                student_log_probs = F.log_softmax(
-                    student_logits_for_loss / self.temperature, dim=-1
-                )
-                del student_logits_for_loss
-                empty_cache()
+                # --- Student log_probs ---
+                # bon_n > 1 or dynamic_lh: already computed and pre-selected above;
+                # student_logits_for_loss was freed there too.
+                # All other modes: compute here and free logits.
+                if _bon_student_log_probs is not None:
+                    student_log_probs = _bon_student_log_probs
+                    _bon_student_log_probs = None
+                elif _lh_student_log_probs is not None:
+                    student_log_probs = _lh_student_log_probs
+                    _lh_student_log_probs = None
+                else:
+                    student_log_probs = F.log_softmax(
+                        student_logits_for_loss / self.temperature, dim=-1
+                    )
+                    del student_logits_for_loss
+                    empty_cache()
 
-                # === DYNAMIC ROLLOUT SELECTION ===
-                if self.rollout_keep_ratio < 1.0:
+                # === DYNAMIC ROLLOUT SELECTION (dynamic K,H or random — NOT dynamic_lh or BoN) ===
+                # dynamic_lh and bon_n>1 already handled pre-selection before Teacher forward.
+                if self.rollout_keep_ratio < 1.0 and self.rollout_select_mode != "dynamic_lh" and self.bon_n == 1:
                     selected, sel_stats = self._select_rollout_indices(
                         student_log_probs, teacher_log_probs, shifted_labels
                     )
@@ -1031,7 +1196,7 @@ class OPSDTrainer(SFTTrainer):
             if self.accelerator.is_main_process:
                 completion_ids = self.vllm_client.generate(
                     prompts=all_prompts_text,
-                    n=1,  # In GKD, we generate 1 completion per prompt from student
+                    n=self.bon_n,  # bon_n>=1; n>1 enables Best-of-N generation
                     repetition_penalty=repetition_penalty,
                     temperature=temperature,
                     top_p=top_p,
@@ -1042,11 +1207,12 @@ class OPSDTrainer(SFTTrainer):
                     guided_decoding_regex=self.vllm_guided_decoding_regex,
                 )
             else:
-                completion_ids = [None] * len(all_prompts_text)
+                completion_ids = [None] * len(all_prompts_text) * self.bon_n
             completion_ids = broadcast_object_list(completion_ids, from_process=0)
+            # Each process owns bon_n completions per prompt
             process_slice = slice(
-                self.accelerator.process_index * len(prompts_text_for_vllm),
-                (self.accelerator.process_index + 1) * len(prompts_text_for_vllm),
+                self.accelerator.process_index * len(prompts_text_for_vllm) * self.bon_n,
+                (self.accelerator.process_index + 1) * len(prompts_text_for_vllm) * self.bon_n,
             )
             completion_ids = completion_ids[process_slice]
         elif self.vllm_mode == "colocate":
@@ -1057,7 +1223,7 @@ class OPSDTrainer(SFTTrainer):
             else:
                 guided_decoding = None
             sampling_params = SamplingParams(
-                n=1,
+                n=self.bon_n,  # bon_n>=1; n>1 enables Best-of-N generation
                 repetition_penalty=repetition_penalty,
                 temperature=temperature,
                 top_p=top_p,
@@ -1125,6 +1291,10 @@ class OPSDTrainer(SFTTrainer):
         ).to(device)
         prompt_ids = prompt_tokenized.input_ids
 
+        # BoN: each prompt has bon_n completions → repeat prompt_ids N times so indices align
+        if self.bon_n > 1:
+            prompt_ids = prompt_ids.repeat_interleave(self.bon_n, dim=0)
+
         completion_ids_tensors = [torch.tensor(ids, device=device) for ids in completion_ids]
         # Manually pad/truncate completions to max_completion_length length before using pad function
         padded_completion_ids_list = []
@@ -1171,6 +1341,10 @@ class OPSDTrainer(SFTTrainer):
         for comp_ids in completion_ids:
             completion_text = self.processing_class.decode(comp_ids, skip_special_tokens=False)
             completion_texts.append(completion_text)
+
+        # BoN: repeat prompt texts to match B×N completions
+        if self.bon_n > 1:
+            prompts_text_with_special = [p for p in prompts_text_with_special for _ in range(self.bon_n)]
 
         return new_input_ids, new_attention_mask, new_labels, prompts_text_with_special, completion_texts
 
@@ -1529,7 +1703,14 @@ class OPSDTrainer(SFTTrainer):
         inputs["student_attention_mask"] = generated_attention_mask
 
         # Construct teacher full sequence: [teacher_prompt][generation]
+        # BoN: teacher_prompts is [B, T_t]; expand to [B×N, T_t] to match B×N generations.
+        # student_prompt_lengths_per_example also needs expanding for correct label masking.
         teacher_prompts = inputs["teacher_prompts"]
+        if self.bon_n > 1:
+            teacher_prompts = teacher_prompts.repeat_interleave(self.bon_n, dim=0)
+            inputs["student_prompt_lengths_per_example"] = (
+                inputs["student_prompt_lengths_per_example"].repeat_interleave(self.bon_n)
+            )
         teacher_full_ids = torch.cat([teacher_prompts, generation_ids], dim=1)
 
         # Create attention mask for teacher

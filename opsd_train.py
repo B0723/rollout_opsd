@@ -104,7 +104,20 @@ class CustomScriptArguments(ScriptArguments):
         default="dynamic",
         metadata={
             "help": "Rollout selection strategy when rollout_keep_ratio < 1.0. "
-            "'dynamic': score S_i = K_hat*(1-H_hat). 'random': uniform random baseline."
+            "'dynamic': S_i = K_hat*(1-H_hat), requires Teacher forward on full batch. "
+            "'dynamic_lh': S_i = (1-L_hat)*(1-H_hat), Teacher-free scoring — Teacher "
+            "forward only runs on selected samples (~50%% Teacher compute). "
+            "'random': uniform random baseline."
+        },
+    )
+    bon_n: int = field(
+        default=1,
+        metadata={
+            "help": "Best-of-N rollouts per problem. 1 = standard OPSD (no BoN). "
+            "N > 1: generate N completions per problem, select the best 1 per problem "
+            "using S_i = (1-L_hat)*(1-H_hat) within-group, then distill only the selected. "
+            "Distillation count stays the same (B problems); Teacher forward still runs "
+            "only on B selected sequences regardless of N."
         },
     )
 
@@ -128,9 +141,11 @@ if __name__ == "__main__":
     )
 
     # Rollout selection suffix — appended to both output_dir and wandb name
-    # so that baseline / random / dynamic experiments never share the same directory.
+    # so that baseline / random / dynamic / BoN experiments never share the same directory.
     rollout_suffix = ""
-    if script_args.rollout_keep_ratio < 1.0:
+    if script_args.bon_n > 1:
+        rollout_suffix = f"_bon{script_args.bon_n}"
+    elif script_args.rollout_keep_ratio < 1.0:
         keep_pct = int(script_args.rollout_keep_ratio * 100)
         rollout_suffix = f"_{script_args.rollout_select_mode}{keep_pct}pct"
 
@@ -210,6 +225,7 @@ if __name__ == "__main__":
                 "ema_decay": script_args.ema_decay if script_args.use_ema_teacher else None,
                 "rollout_keep_ratio": script_args.rollout_keep_ratio,
                 "rollout_select_mode": script_args.rollout_select_mode if script_args.rollout_keep_ratio < 1.0 else None,
+                "bon_n": script_args.bon_n if script_args.bon_n > 1 else None,
             },
         )
 
@@ -297,6 +313,7 @@ if __name__ == "__main__":
         ema_decay=script_args.ema_decay,
         rollout_keep_ratio=script_args.rollout_keep_ratio,
         rollout_select_mode=script_args.rollout_select_mode,
+        bon_n=script_args.bon_n,
     )
 
     if training_args.eval_strategy != "no":

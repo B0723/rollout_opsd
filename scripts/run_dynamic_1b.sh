@@ -1,7 +1,12 @@
 export https_proxy=http://10.217.142.137:8080
 export WANDB_MODE=online
 
-# Baseline OPSD — Qwen3-1.7B  4 GPU  effective_bs=32
+# Dynamic OPSD — Qwen3-1.7B  4 GPU  effective_bs=32
+# Usage:
+#   bash run_dynamic_1b.sh dynamic      # S_i = K_hat*(1-H_hat), Teacher full batch
+#   bash run_dynamic_1b.sh dynamic_lh   # S_i = (1-L_hat)*(1-H_hat), Teacher on 50% only
+MODE=${1:-dynamic}
+
 accelerate launch \
     --config_file accelerate.yaml \
     --num_processes 4 \
@@ -38,4 +43,6 @@ accelerate launch \
     --lmbda 1 \
     --fixed_teacher \
     --jsd_token_clip 0.05 \
+    --rollout_keep_ratio 0.5 \
+    --rollout_select_mode ${MODE} \
     --wandb_project OPSD
