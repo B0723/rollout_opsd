@@ -43,6 +43,6 @@ accelerate launch \
     --lmbda 1 \
     --fixed_teacher \
     --jsd_token_clip 0.05 \
-    --rollout_keep_ratio 0.5 \
+    --rollout_keep_ratio 0.25 \
     --rollout_select_mode ${MODE} \
     --wandb_project OPSD
