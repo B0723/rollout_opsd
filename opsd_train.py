@@ -116,9 +116,19 @@ class CustomScriptArguments(ScriptArguments):
         metadata={
             "help": "Best-of-N rollouts per problem. 1 = standard OPSD (no BoN). "
             "N > 1: generate N completions per problem, select the best 1 per problem "
-            "using S_i = (1-L_hat)*(1-H_hat) within-group, then distill only the selected. "
+            "within-group, then distill only the selected. "
             "Distillation count stays the same (B problems); Teacher forward still runs "
             "only on B selected sequences regardless of N."
+        },
+    )
+    bon_select_mode: str = field(
+        default="score_hl",
+        metadata={
+            "help": "Selection strategy within each BoN group. Only active when bon_n > 1. "
+            "'score_hl': S_i = (1-H_hat)*(1-L_hat), our proposed method (default). "
+            "'high_entropy': argmax mean entropy — ablation. "
+            "'low_entropy': argmin mean entropy — ablation. "
+            "'random': uniform random — baseline."
         },
     )
 
@@ -145,7 +155,7 @@ if __name__ == "__main__":
     # so that baseline / random / dynamic / BoN experiments never share the same directory.
     rollout_suffix = ""
     if script_args.bon_n > 1:
-        rollout_suffix = f"_bon{script_args.bon_n}"
+        rollout_suffix = f"_bon{script_args.bon_n}_{script_args.bon_select_mode}"
     elif script_args.rollout_keep_ratio < 1.0:
         keep_pct = int(script_args.rollout_keep_ratio * 100)
         rollout_suffix = f"_{script_args.rollout_select_mode}{keep_pct}pct"
@@ -227,6 +237,7 @@ if __name__ == "__main__":
                 "rollout_keep_ratio": script_args.rollout_keep_ratio,
                 "rollout_select_mode": script_args.rollout_select_mode if script_args.rollout_keep_ratio < 1.0 else None,
                 "bon_n": script_args.bon_n if script_args.bon_n > 1 else None,
+                "bon_select_mode": script_args.bon_select_mode if script_args.bon_n > 1 else None,
             },
         )
 
@@ -315,6 +326,7 @@ if __name__ == "__main__":
         rollout_keep_ratio=script_args.rollout_keep_ratio,
         rollout_select_mode=script_args.rollout_select_mode,
         bon_n=script_args.bon_n,
+        bon_select_mode=script_args.bon_select_mode,
     )
 
     if training_args.eval_strategy != "no":

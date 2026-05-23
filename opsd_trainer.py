@@ -145,6 +145,7 @@ class OPSDTrainer(SFTTrainer):
         rollout_keep_ratio: float = 1.0,
         rollout_select_mode: str = "dynamic",
         bon_n: int = 1,
+        bon_select_mode: str = "score_hl",
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -191,6 +192,7 @@ class OPSDTrainer(SFTTrainer):
         self.rollout_keep_ratio = rollout_keep_ratio
         self.rollout_select_mode = rollout_select_mode
         self.bon_n = bon_n
+        self.bon_select_mode = bon_select_mode
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:
@@ -241,11 +243,18 @@ class OPSDTrainer(SFTTrainer):
             print(f"{'='*80}\n")
 
         if self.bon_n > 1:
+            _bon_score_desc = {
+                "score_hl":    "S_i = (1-H_hat)*(1-L_hat)  [proposed]",
+                "high_entropy": "S_i = H_i  argmax entropy  [ablation]",
+                "low_entropy":  "S_i = -H_i argmin entropy  [ablation]",
+                "random":       "uniform random             [baseline]",
+            }.get(self.bon_select_mode, self.bon_select_mode)
             print(f"\n{'='*80}")
             print("BEST-OF-N ENABLED")
-            print(f"  N per problem: {self.bon_n}")
-            print(f"  Selection:     S_i = (1-L_hat)*(1-H_hat) within each problem group")
-            print(f"  Teacher cost:  same as N=1 (Teacher only forwards selected rollouts)")
+            print(f"  N per problem:  {self.bon_n}")
+            print(f"  Select mode:    {self.bon_select_mode}")
+            print(f"  Score:          {_bon_score_desc}")
+            print(f"  Teacher cost:   same as N=1 (Teacher only forwards selected rollouts)")
             print(f"{'='*80}\n")
 
         # Track per-step loss statistics for on/off-policy batches (used in logging)
@@ -1669,12 +1678,17 @@ class OPSDTrainer(SFTTrainer):
         # === GENERATION PHASE ===
         if self.bon_n > 1 and self.use_vllm:
             # BoN: generate bon_n rollouts per problem via a for-loop (n=1 each time).
-            # This keeps memory at [B, T, V] per iteration instead of [B×N, T, V] — no OOM.
-            # Selection uses shortest completion length as a quality proxy (no forward needed).
+            # Selection mode controlled by self.bon_select_mode:
+            #   'score_hl'    : (1-H_hat)*(1-L_hat)  — proposed method
+            #   'high_entropy': argmax mean entropy   — ablation
+            #   'low_entropy' : argmin mean entropy   — ablation
+            #   'random'      : uniform random        — baseline
             _student_prompt_len = inputs["student_prompt_length"]
             _pad_id = self.processing_class.pad_token_id
+            _need_entropy = self.bon_select_mode in ("score_hl", "high_entropy", "low_entropy")
             _bon_gids, _bon_amasks, _bon_lens = [], [], []
             _bon_ptexts, _bon_ctexts = [], []
+            _bon_H = []  # mean entropy per sample per iteration [B]; populated when needed
 
             for _ in range(self.bon_n):
                 self._wake_vllm_if_needed()
@@ -1682,18 +1696,54 @@ class OPSDTrainer(SFTTrainer):
                     inputs, self.generation_config, _pad_id
                 )
                 _gids, _amask, _, _ptexts, _ctexts = _r
-                # Completion length: count non-pad tokens (no neural forward needed)
                 _comp = _gids[:, _student_prompt_len:]
-                _lens = (_comp != _pad_id).float().sum(dim=-1)  # [B]
+                _lens = (_comp != _pad_id).float().sum(dim=-1).clamp(min=1)  # [B]
+
+                if _need_entropy:
+                    # Student forward to compute per-sample mean entropy; freed immediately.
+                    with torch.no_grad():
+                        _out = model(input_ids=_gids, attention_mask=_amask)
+                        _logits = _out.logits[:, _student_prompt_len - 1 : -1, :]
+                        _lp = F.log_softmax(_logits / self.temperature, dim=-1)
+                        del _out, _logits
+                        _entropy_per_tok = -(_lp.exp() * _lp).sum(dim=-1)  # [B, T_comp]
+                        del _lp
+                        _comp_mask = (_comp != _pad_id).float()
+                        H_i = (_entropy_per_tok * _comp_mask).sum(dim=-1) / _lens  # [B]
+                        del _entropy_per_tok, _comp_mask
+                        empty_cache()
+                    _bon_H.append(H_i)
+
                 _bon_gids.append(_gids)
                 _bon_amasks.append(_amask)
                 _bon_lens.append(_lens)
                 _bon_ptexts.append(_ptexts)
                 _bon_ctexts.append(_ctexts)
 
-            # For each problem, select the iteration that produced the shortest completion
-            _all_lens = torch.stack(_bon_lens, dim=1)          # [B, bon_n]
-            _best = _all_lens.argmin(dim=1)                    # [B]
+            # --- Select best iteration per problem ---
+            _all_L = torch.stack(_bon_lens, dim=1)  # [B, N]
+
+            def _group_minmax(x):
+                x_min = x.min(dim=1, keepdim=True).values
+                x_max = x.max(dim=1, keepdim=True).values
+                return (x - x_min) / (x_max - x_min + 1e-8)
+
+            if self.bon_select_mode == "score_hl":
+                _all_H = torch.stack(_bon_H, dim=1)  # [B, N]
+                _scores = (1.0 - _group_minmax(_all_H)) * (1.0 - _group_minmax(_all_L))
+                _best = _scores.argmax(dim=1)
+            elif self.bon_select_mode == "high_entropy":
+                _all_H = torch.stack(_bon_H, dim=1)  # [B, N]
+                _best = _all_H.argmax(dim=1)
+            elif self.bon_select_mode == "low_entropy":
+                _all_H = torch.stack(_bon_H, dim=1)  # [B, N]
+                _best = _all_H.argmin(dim=1)
+            elif self.bon_select_mode == "random":
+                _B_size = _all_L.shape[0]
+                _best = torch.randint(0, self.bon_n, (_B_size,), device=_all_L.device)
+            else:
+                raise ValueError(f"Unknown bon_select_mode: {self.bon_select_mode!r}")
+
             _B = _best.shape[0]
             generated_ids = torch.stack(
                 [_bon_gids[_best[b].item()][b] for b in range(_B)], dim=0
