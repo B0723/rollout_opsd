@@ -146,6 +146,8 @@ class OPSDTrainer(SFTTrainer):
         rollout_select_mode: str = "dynamic",
         bon_n: int = 1,
         bon_select_mode: str = "score_hl",
+        student_thinking: bool = False,
+        teacher_thinking: bool = True,
     ):
         self.model_name_or_path = model if isinstance(model, str) else model.config._name_or_path
         self.model_revision = getattr(args, "student_model_revision", None)
@@ -156,7 +158,11 @@ class OPSDTrainer(SFTTrainer):
         # Custom data collator for self-distillation
         if data_collator is None:
             data_collator = SelfDistillationDataCollator(
-                tokenizer=processing_class, max_length=args.max_length, reason_first=reason_first
+                tokenizer=processing_class,
+                max_length=args.max_length,
+                reason_first=reason_first,
+                student_thinking=student_thinking,
+                teacher_thinking=teacher_thinking,
             )
 
         super().__init__(
@@ -193,6 +199,8 @@ class OPSDTrainer(SFTTrainer):
         self.rollout_select_mode = rollout_select_mode
         self.bon_n = bon_n
         self.bon_select_mode = bon_select_mode
+        self.student_thinking = student_thinking
+        self.teacher_thinking = teacher_thinking
 
         # Validate fixed_teacher option
         if self.fixed_teacher and peft_config is None:

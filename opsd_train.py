@@ -131,6 +131,20 @@ class CustomScriptArguments(ScriptArguments):
             "'random': uniform random — baseline."
         },
     )
+    student_thinking: bool = field(
+        default=False,
+        metadata={
+            "help": "Whether to enable Qwen3 thinking mode for the student during rollout. "
+            "Default False (student rolls out without <think>)."
+        },
+    )
+    teacher_thinking: bool = field(
+        default=True,
+        metadata={
+            "help": "Whether to enable Qwen3 thinking mode for the teacher when scoring student tokens. "
+            "Default True. Set to False for the matched non-thinking ablation (both nonthink)."
+        },
+    )
 
 
 if __name__ == "__main__":
@@ -238,6 +252,8 @@ if __name__ == "__main__":
                 "rollout_select_mode": script_args.rollout_select_mode if script_args.rollout_keep_ratio < 1.0 else None,
                 "bon_n": script_args.bon_n if script_args.bon_n > 1 else None,
                 "bon_select_mode": script_args.bon_select_mode if script_args.bon_n > 1 else None,
+                "student_thinking": script_args.student_thinking,
+                "teacher_thinking": script_args.teacher_thinking,
             },
         )
 
@@ -327,6 +343,8 @@ if __name__ == "__main__":
         rollout_select_mode=script_args.rollout_select_mode,
         bon_n=script_args.bon_n,
         bon_select_mode=script_args.bon_select_mode,
+        student_thinking=script_args.student_thinking,
+        teacher_thinking=script_args.teacher_thinking,
     )
 
     if training_args.eval_strategy != "no":
