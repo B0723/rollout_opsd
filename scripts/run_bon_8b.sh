@@ -1,5 +1,5 @@
 export https_proxy=http://10.217.142.137:8080
-export WANDB_MODE=online
+export WANDB_MODE=offline
 
 # Best-of-N OPSD — Qwen3-8B  8 GPU  effective_bs=32
 # Generates bon_n rollouts per problem, selects best by (1-L_hat)*(1-H_hat),

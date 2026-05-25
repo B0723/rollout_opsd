@@ -2,7 +2,7 @@ export https_proxy=http://10.217.142.137:8080
 export WANDB_MODE=online
 
 # BoN ablation — Qwen3-1.7B  4 GPU  effective_bs=32
-# Loops over N = 2, 6, 8, 12, 16
+# Loops over N = 2, 4, 6, 8, 12, 16
 
 run_bon() {
     local N=$1
@@ -53,7 +53,7 @@ run_bon() {
     echo ""
 }
 
-for N in 2 6 8 12 16; do
+for N in 2 4 6 8 12 16; do
     run_bon ${N}
 done
 
